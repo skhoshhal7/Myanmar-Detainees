@@ -1,0 +1,1360 @@
+---
+title: "Exploring Education and Gender Impacts on Detainee and Fatality Counts in Post-Coup Myanmar"
+author: "Yijin Yang, Sara Khoshhal, and Sara Maillacheruvu"
+date: "12/9/2021"
+output: html_document
+---
+
+```{r include=FALSE, warning=FALSE, echo=FALSE} 
+```
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+library(tidyverse)
+library(knitr)
+
+# Import starting data (AAPP)
+detainees = read_csv("https://www.andrew.cmu.edu/user/jweiss2/21f_r/94842/final_2021/detained.csv.gz")
+imprisoned = read_csv("https://www.andrew.cmu.edu/user/jweiss2/21f_r/94842/final_2021/imprisoned.csv.gz")
+fallen = read_csv("https://www.andrew.cmu.edu/user/jweiss2/21f_r/94842/final_2021/fallen.csv")
+conflicts = read_csv("https://www.andrew.cmu.edu/user/jweiss2/21f_r/94842/final_2021/conflicts.csv.gz")
+tmp = tempfile(fileext = ".xlsm")
+httr::GET(
+  url = "https://www.andrew.cmu.edu/user/jweiss2/21f_r/94842/final_2021/MIMU_BaselineData_AllSectors_Countrywide_18Mar2021_revised.xlsm", 
+  httr::write_disk(tmp)
+)
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+sector.indicators = 
+  readxl::read_xlsx(tmp, sheet=3, skip = 5) %>% as_tibble()
+
+
+### Organize all sectors data to be given by nested tibbles per indicator
+sector.nest = sector.indicators %>% 
+  select(1:3, 
+         Indicator_Name, Indicator_Type, Sector, Unit, 
+         starts_with("20"), Source_Name) %>%
+  mutate(Indicator = paste(Indicator_Name, Indicator_Type, 
+                           Sector, Unit, Source_Name, sep="|")) %>%
+  select(1:3, Indicator, starts_with("20")) %>%
+  pivot_longer(cols = starts_with("20"), 
+               names_to = "Year", 
+               values_to="Value") %>%
+  filter(!is.na(Value)) %>%
+  nest(data = -Indicator) %>%
+  separate(Indicator, sep="\\|", 
+           into = c("Indicator_Name", "Indicator_Type",
+                    "Sector","Unit","Source_Name")) 
+```
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+# We can use the Levenshtein distance to find approximate matches at the township level.
+
+#' level computes the levenshtein distance between x and each y and returns
+#' the ones that are within k of the smallest value as an ordered vector. 
+#' See ?adist for details.
+#' @return data.frame of hits
+leven = function(x, y, k=0, ignore.case=T) {
+  data.frame(y=y) %>%
+    as_tibble() %>%
+    
+    # compute Levenshtein distance for string x for each y
+    mutate(distance = utils::adist(x, y, 
+                                   ignore.case=ignore.case) %>% .[1,]) %>%
+    
+    # keep y's within k of the best match
+    filter(distance <= min(distance, na.rm=T) + k) %>%
+    mutate(distance.per.char = distance/nchar(y))
+}
+
+# Use `leven` for string *vectors* `x` and `y`
+apply_leven = function(x, y, k=0, distance.threshold=0.3, ignore.case=F) {
+  data.frame(x=x) %>%
+    # get potential matches for each x as a list of tibbles
+    mutate(leven.df = map(x, ~ leven(.x, y=y,
+                                     k=k, ignore.case=ignore.case))
+    ) %>%
+    unnest(everything()) %>%
+    mutate(is.match=distance.per.char < distance.threshold) %>%
+    
+    # order by best match
+    arrange(distance.per.char) %>%
+    
+    # keep the best match per `x`
+    group_by(x) %>% 
+    slice(1) %>%  
+    ungroup() %>%
+    
+    # convert non-matches to Other
+    mutate(y = ifelse(is.match, y, "Other"))  
+}
+```
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+#Perform step 1.  Create a detainees object `nested.det` that is at the township level and contains the number of detainees per township. Print the number of "townships" (note this may be larger or smaller than the true number due to townships represented as free text (potentially larger) or lack of representation (potentially smaller)).
+detainees = detainees %>%
+  mutate(Township = str_replace_all(Address,".*,","")) %>%
+  mutate(Township = str_replace_all(Township,"T?own.*",""))
+
+nested.det = detainees %>% nest(data=-Township)
+nested.det %>% nrow()
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+#*Perform step 2. Find the nested data.frame in `sector.nest` corresponding to population sizes (Indicator_Name is "Population size", Indicator_Type is "Total"), unnest it, and assign it to variable `township.sizes`.  Use the census data which is slightly outdated but the most complete. Then, use the code below to merge the detainee and MIMU townships using `apply_leven`.
+
+# Edit me
+township.sizes = sector.nest %>% 
+  filter(Indicator_Name=="Population size", 
+         Indicator_Type=="Total", 
+         str_detect(Source_Name, "Census")) %>%
+  unnest(everything())
+
+### Use the following code
+joined.det = nested.det %>%
+  inner_join(apply_leven(nested.det$Township, 
+                         township.sizes$Township_Name,
+                         distance.threshold=0.28),
+             # 0.28 eliminates the common incorrect 
+             # match of Yangon --> Ywangan
+             by=c("Township"="x")
+  ) %>%
+  rename(detainee_township=Township, MIMU_township=y)
+joined.det
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+#Complete step 3. Summarize the detainee count at the MIMU_township level (assign the result to `joined.mimu`), then use the code below to merge with the `township.sizes`.
+# Edit me
+joined.mimu = joined.det %>%
+  group_by(MIMU_township) %>%
+  summarise(detainees = sum(map_dbl(data,nrow)))
+
+# Use the following code to complete the merge
+joined.mimu %>%
+  left_join(township.sizes, by=c("MIMU_township"="Township_Name"))
+
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+#Show the 5 townships with the highest detainee count, and also print those township's detainees per capita.  Your result should illustrate that the orderings by detainees and detainees.per.capita is not the same.
+joined.mimu %>%
+  left_join(township.sizes, by=c("MIMU_township"="Township_Name")) %>%
+  mutate(detainees.per.1000 = detainees/Value) %>%
+  arrange(desc(detainees)) %>% head(5) %>% 
+  select(MIMU_township, detainees, detainees.per.1000)
+
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+#Convert the code from part (c) to (f) into a single pipe from variables `detainees` and `township.sizes`. You may find this code useful to adapt when wanting to pull indicators besides "Population size" for your analyses.
+
+detainees.per.1000 <- detainees %>% 
+  # part (c): nesting
+  nest(data=-Township) %>%
+  # part (d): merging with the detainee_township, MIMU_township mapper
+  inner_join(apply_leven(.$Township,
+                         township.sizes$Township_Name,
+                         distance.threshold=0.28),
+             by=c("Township"="x")
+  ) %>%
+  rename(detainee_township=Township, MIMU_township=y) %>%
+  # part (e): summarise at MIMU_township level
+  group_by(MIMU_township) %>%
+  summarise(detainees = sum(map_dbl(data,nrow))) %>%
+  ungroup() %>%
+  # part (f): attach MIMU indicator and compute outcome "detainees.per.1000"
+  left_join(township.sizes, by=c("MIMU_township"="Township_Name")) %>%
+  mutate(detainees.per.1000 = detainees/Value) %>%
+  arrange(desc(detainees)) %>%
+  select(MIMU_township, detainees, detainees.per.1000)
+
+detainees.per.1000 <- detainees.per.1000 %>% head(20) %>% kable()
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+detainees.clean = nested.det %>% unnest(everything())
+detainees.clean
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+#Making assumption that levels beginning with M are Male and levels beginning with F are female
+#There were three individuals labels LGBT. Due to the small number of LGBT individuals, we felt that there were not enough observations in the subgroup to conduct meaningful and statistically sound analysis on this subgroup. Therefore, we chose to drop this group.
+detainees.clean = detainees %>%
+  mutate(`Sex` = 
+            str_replace_all(`Sex`,"[^MF]",""))
+
+detainees.clean %>% group_by(`Sex`) %>% count()
+
+detainees.clean = detainees.clean %>%
+  mutate(`Sex` = 
+           case_when(str_detect(`Sex`, "MM") ~ "M",
+                     str_detect(`Sex`, "MMM") ~ "M",
+                     T ~ `Sex`  # else keep the same
+           )
+  )
+
+detainees.clean %>% group_by(`Sex`) %>% count()
+```
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+#replacing all non-numeric characters
+detainees.clean = detainees.clean %>%
+  mutate(`Age` = 
+            str_replace_all(`Age`,"[^0-9.]"," ")) %>%
+  mutate(`Age` = 
+            str_replace_all(`Age`,"[.0]","")) %>% #getting rid of '.0'
+  mutate(`Age` = 
+            str_replace_all(`Age`,"[ .*]",""))
+
+#we make the assumption that some rows had years + month (e.g. '5y6m'). For these values, we are rounding down to the closest year value by removing the month value
+
+detainees.clean %>% group_by(`Age`) %>% count()
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+#Below we clean the Date detained column of detainees
+
+detainees.clean$`Date clean` = detainees.clean$`Date of Arrest` %>%
+  gsub("(and).*", "\\1", .) %>%
+  gsub("(&).*", "\\1", .) %>%
+  gsub(" ", "", .) %>%
+  gsub("and", "", .) %>%
+  gsub("&", "", .)
+
+detainees.clean = detainees.clean %>%
+  mutate(`Date clean` = 
+           case_when(str_detect(`Date clean`, ",16D-aSwepe-i2U1niversit") ~ "",
+                     str_detect(`Date clean`, ",2T-Oaucnt-g2g1yiMedica") ~ "",
+                     str_detect(`Date clean`, "1D4a-gSoenp-U2n1iversity") ~ "",
+                     str_detect(`Date clean`, "1d4e-lNov-21") ~ "14-Nov-21",
+                     str_detect(`Date clean`, "1h2e-rNov-21") ~ "12-Nov-21",
+                     str_detect(`Date clean`, "1o4n-SUenpi-v2e1rsity\\)") ~ "",
+                     str_detect(`Date clean`, "2c0u-tNivoev-21") ~ "20-Nov-21",
+                     str_detect(`Date clean`, "2h0e-rNov-21") ~ "20-Nov-21",
+                     str_detect(`Date clean`, "2i6n-,OPcyti-2T1hayarW") ~ "26-Oct-21",
+                     str_detect(`Date clean`, "2in2-PSheopn-2e1ShopO") ~ "22-Sep-21",
+                     str_detect(`Date clean`, "2y2o-MSeypi-n2t1") ~ "22-Sep-21",
+                     str_detect(`Date clean`, "3o-nNkov-21") ~ "30-Nov-21",
+                     str_detect(`Date clean`, "4h-nOoclto-g2i1calUnive") ~ "",
+                     str_detect(`Date clean`, "4r-icSuelpt-u2r1alPharm") ~ "",
+                     str_detect(`Date clean`, "8vi-sOtct-21") ~ "8-Oct-21",
+                     str_detect(`Date clean`, "9h-eNrov-21") ~ "9-Nov-21",
+                     str_detect(`Date clean`, "a1c7h-Seerp-21") ~ "17-Sep-21",
+                     str_detect(`Date clean`, "a1c8h-Serep-21") ~ "18-Sep-21",
+                     str_detect(`Date clean`, "a1i1r-mNaonv-21") ~ "11-Nov-21",
+                     str_detect(`Date clean`, "a3u0k-sSeeTp-e2c1hnologic") ~ "",
+                     str_detect(`Date clean`, "April") ~ "1-Apr-21",
+                     str_detect(`Date clean`, "Aug") ~ "1-Aug-21",
+                     str_detect(`Date clean`, "August") ~ "1-Aug-21",
+                     str_detect(`Date clean`, "b11e-rSep-21") ~ "11-Sep-21",
+                     str_detect(`Date clean`, "D14a-gSoenpU-2n1iversity\\)") ~ "",
+                     str_detect(`Date clean`, "February") ~ "1-Feb-21",
+                     str_detect(`Date clean`, "g1o4n-SUenp-iv2e1rsity\\)") ~ "",
+                     str_detect(`Date clean`, "Jun") ~ "1-Jun-21",
+                     str_detect(`Date clean`, "June") ~ "1-Jun-21",
+                     str_detect(`Date clean`, "m17b-Nerov-21") ~ "",
+                     str_detect(`Date clean`, "March") ~ "1-Mar-21",
+                     str_detect(`Date clean`, "May") ~ "1-May-21",
+                     str_detect(`Date clean`, "n1g1-aSnegpy-u2n1PostNe") ~ "",
+                     str_detect(`Date clean`, "n1g4w-SaeTp-o2w1nship,Y") ~ "",
+                     str_detect(`Date clean`, "November") ~ "1-Nov-21",
+                     str_detect(`Date clean`, "o2n-OUcnt-iv2e1rsity\\)") ~ "",
+                     str_detect(`Date clean`, "October") ~ "1-Oct-21",
+                     str_detect(`Date clean`, "r13-Nov-21") ~ "13-Nov-21",
+                     str_detect(`Date clean`, "r22-Nov-21") ~ "22-Nov-21",
+                     str_detect(`Date clean`, "S3t-aOffct-21") ~ "3-Oct-21",
+                     str_detect(`Date clean`, "September") ~ "1-Sep-21",
+                     str_detect(`Date clean`, "t2a2y-GSeopld-2S1hopOw") ~ "",
+                     str_detect(`Date clean`, "u1t1i-vNeov-21") ~ "11-Nov-21",
+                     str_detect(`Date clean`, "u2t0iv-Neov-21") ~ "21-Nov-21",
+                     str_detect(`Date clean`, "UnknownDate") ~ "",
+                     str_detect(`Date clean`, "w2e2-GSoelpd-2S1hop") ~ "",
+                     T ~ `Date clean`
+                     )
+         )  # else keep the same
+
+library(lubridate, warn.conflicts = FALSE)
+
+detainees.clean = detainees.clean %>%
+  mutate(`Date clean` = dmy(`Date clean`))
+
+detainees.clean %>% group_by(`Date clean`) %>% count()
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+#below, we clean the region column of detainees
+
+detainees.clean = detainees.clean %>%
+  mutate(`Region clean` = `Region/State`)
+
+detainees.clean = detainees.clean %>%
+  mutate(`Region clean` = 
+           case_when(str_detect(`Region clean`, "She was arrested at her home.") ~ "",
+                     str_detect(`Region clean`, "Arrested at home") ~ "",
+                     str_detect(`Region clean`, "ady") ~ "Ayeyarwaddy",
+                     str_detect(`Region clean`, "addy") ~ "Ayeyarwaddy",
+                     str_detect(`Region clean`, "A") ~ "Ayeyarwaddy",
+                     str_detect(`Region clean`, "B") ~ "Bago",
+                     str_detect(`Region clean`, "Khiapchin") ~ "Kachin",
+                     str_detect(`Region clean`, "Kshaicphin") ~ "Kachin",
+                     str_detect(`Region clean`, "yin") ~ "Kayin",
+                     str_detect(`Region clean`, "ah") ~ "Kayah",
+                     str_detect(`Region clean`, ",S Kagaalainy gTownshi") ~ "Kayah",
+                     str_detect(`Region clean`, "gw") ~ "Magwe",
+                     str_detect(`Region clean`, "tMbyaug wTeownship") ~ "Magwe",
+                     str_detect(`Region clean`, "ag") ~ "Magwe",
+                     str_detect(`Region clean`, "iMntabgywue Townshi") ~ "Magwe",
+                     str_detect(`Region clean`, "Mbyaug Twoewnship") ~ "Magwe",
+                     str_detect(`Region clean`, "Minatgbwyue Townshi") ~ "Magwe",
+                     str_detect(`Region clean`, "we") ~ "Magwe",
+                     str_detect(`Region clean`, "Mo") ~ "Mon",
+                     str_detect(`Region clean`, "on") ~ "Mon",
+                     str_detect(`Region clean`, "on") ~ "Mon",
+                     str_detect(`Region clean`, "nMg oTnownship") ~ "Mon",
+                     str_detect(`Region clean`, "Marodn, Kyaikhto T") ~ "Mon",
+                     str_detect(`Region clean`, "wMnosnhip") ~ "Mon",
+                     str_detect(`Region clean`, "ay") ~ "Mandalay",
+                     str_detect(`Region clean`, "gMe,a Nndyaulanyg-u To") ~ "Mandalay",
+                     str_detect(`Region clean`, "Yan") ~ "Yangon",
+                     str_detect(`Region clean`, "Y") ~ "Yangon",
+                     str_detect(`Region clean`, "gon") ~ "Yangon",
+                     str_detect(`Region clean`, "thar") ~ "Tanintharyi",
+                     str_detect(`Region clean`, "Tgea,n Pinutlhaawr yTiown") ~ "Tanintharyi",
+                     str_detect(`Region clean`, "NTaoywpnysihtaiwp") ~ "Tanintharyi",
+                     str_detect(`Region clean`, "aMna Tnodwanlasyhip") ~ "Tanintharyi",
+                     str_detect(`Region clean`, "ryi") ~ "Tanintharyi",
+                     str_detect(`Region clean`, "R") ~ "Rakhine",
+                     str_detect(`Region clean`, "Sa") ~ "Sagaing",
+                     str_detect(`Region clean`, "ing") ~ "Sagaing",
+                     str_detect(`Region clean`, "SVaigllaigneg") ~ "Sagaing",
+                     str_detect(`Region clean`, "Sha") ~ "Shan",
+                     str_detect(`Region clean`, "aSyh") ~ "Shan",
+                     str_detect(`Region clean`, "Shhipan") ~ "Shan",
+                     str_detect(`Region clean`, "Siphan") ~ "Shan",
+                     str_detect(`Region clean`, "nSshhainp") ~ "Shan",
+                     str_detect(`Region clean`, "oSwhnasnhip") ~ "Shan",
+                     str_detect(`Region clean`, "S Thoawnnship") ~ "Shan",
+                     T ~ `Region clean`
+                     )
+  )
+
+detainees.clean %>% group_by(`Region clean`) %>% count()
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+#Below we clean the Status column of detainees
+
+detainees.clean = detainees.clean %>%
+  mutate(`Status clean` = `Status`)
+
+
+detainees.clean = detainees.clean %>%
+  mutate(`Status clean` = 
+           case_when(str_detect(`Status clean`, "Admin") ~ "Adminstrator",
+                     str_detect(`Status clean`, "Agri") ~ "Agriculture",
+                     str_detect(`Status clean`, "Farm") ~ "Agriculture",
+                     str_detect(`Status clean`, "tist") ~ "Artist",
+                     str_detect(`Status clean`, "Business") ~ "Business",
+                     str_detect(`Status clean`, "Work") ~ "Worker",
+                     str_detect(`Status clean`, "University") ~ "Academic",
+                     str_detect(`Status clean`, "Department") ~ "Academic",
+                     str_detect(`Status clean`, "Professor") ~ "Academic",
+                     str_detect(`Status clean`, "Company") ~ "Business",
+                     str_detect(`Status clean`, "UEC") ~ "UEC",
+                     str_detect(`Status clean`, "CSO") ~ "CSO",
+                     str_detect(`Status clean`, "Education") ~ "Education",
+                     str_detect(`Status clean`, "Teacher") ~ "Education",
+                     str_detect(`Status clean`, "Government") ~ "Government",
+                     str_detect(`Status clean`, "MP") ~ "Government",
+                     str_detect(`Status clean`, "NLD") ~ "Government",
+                     str_detect(`Status clean`, "Servant") ~ "Government",
+                     str_detect(`Status clean`, "Secretary") ~ "Government",
+                     str_detect(`Status clean`, "Village") ~ "Government",
+                     str_detect(`Status clean`, "Township") ~ "Government",
+                     str_detect(`Status clean`, "Deputy") ~ "Government",
+                     str_detect(`Status clean`, "State") ~ "Government",
+                     str_detect(`Status clean`, "Member") ~ "Government",
+                     str_detect(`Status clean`, "ilian") ~ "Civilian",
+                     str_detect(`Status clean`, "Engineer") ~ "Engineer",
+                     str_detect(`Status clean`, "Media") ~ "Media",
+                     str_detect(`Status clean`, "Repo") ~ "Media",
+                     str_detect(`Status clean`, "Editor") ~ "Media",
+                     str_detect(`Status clean`, "Medic") ~ "Medical",
+                     str_detect(`Status clean`, "Hosp") ~ "Medical",
+                     str_detect(`Status clean`, "Nurs") ~ "Medical",
+                     str_detect(`Status clean`, "Religious") ~ "Religious",
+                     str_detect(`Status clean`, "Photo") ~ "Photographer",
+                     str_detect(`Status clean`, "dent") ~ "Student",
+                     str_detect(`Status clean`, "Grade") ~ "Student",
+                     str_detect(`Status clean`, "Year") ~ "Student",
+                     str_detect(`Status clean`, "olice") ~ "Police",
+                     str_detect(`Status clean`, "Officer") ~ "Police",
+                     str_detect(`Status clean`, "Chari") ~ "Social",
+                     str_detect(`Status clean`, "Welfare") ~ "Social",
+                     T ~ "Other"
+                     )
+  )
+detainees.clean %>% group_by(`Status clean`) %>% count()
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+#Below, we clean the Section of Law column of detainees
+
+detainees.clean = detainees.clean %>%
+  mutate(`Section of law clean` = `Section of Law`)
+
+detainees.clean = detainees.clean %>%
+  mutate(`Section of law clean` = 
+           case_when(str_detect(`Section of Law`, "19") ~ "Weapons Act",
+                     str_detect(`Section of Law`, "sion") ~ "Explosion Law",
+                     str_detect(`Section of Law`, "Weapon") ~ "Weapons Act",
+                     str_detect(`Section of Law`, "55") ~ "Anti-Corruption",
+                     str_detect(`Section of Law`, "50") ~ "Anti-Terrorism",
+                     str_detect(`Section of Law`, "Terror") ~ "Anti-Terrorism",
+                     str_detect(`Section of Law`, "25") ~ "Natural Disaster/Management",
+                     str_detect(`Section of Law`, "Natural") ~ 
+                       "Natural Disaster/Management",
+                     str_detect(`Section of Law`, "Public") ~
+                       "Public Property Protection",
+                     str_detect(`Section of Law`, "66") ~ "Telecommunications Law",
+                     str_detect(`Section of Law`, "17") ~ "Unlawful Associations",
+                     T ~ "Other"
+                     )
+  )
+detainees.clean %>% group_by(`Section of law clean`) %>% count()
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+#Below, we clean the Current Condition column of detainees
+
+detainees.clean = detainees.clean %>%
+  mutate(`Current condition clean` = `Current Condition`)
+
+detainees.clean = detainees.clean %>%
+  mutate(`Current condition clean` = 
+           case_when(str_detect(`Current Condition`, "rison") ~ "Detained in Prison",
+                     str_detect(`Current Condition`, "olice") ~ 
+                       "Detained in Police Station",
+                     str_detect(`Current Condition`, "nter") ~ 
+                       "Detained in Interrogation Center",
+                     str_detect(`Current Condition`, "Detained") ~ 
+                       "Detained",
+                     str_detect(`Current Condition`, "rested") ~ 
+                       "Arrested",
+                     T ~ "Other Detainment Condition"
+                     )
+  )
+
+detainees.clean %>% group_by(`Current condition clean`) %>% count()
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+#We select the clean columns and rename them 
+
+detainees.clean <- detainees.clean %>%
+  select('Name', 'Sex', 'Age', 'Status clean', 'Section of law clean', 'Plaintiff',
+         'Current condition clean', 'Address', 'Region clean', 'Remark', 'Township', 'Date clean') %>%
+  rename(Status = 'Status clean', 'Section of Law' = 'Section of law clean',
+          'Current Condition' = 'Current condition clean', Region = 'Region clean', 'Date Detained' = 'Date clean')
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+cols <- c('Name', 'Sex', 'Age', 'Status', 'Section of Law', 'Plaintiff',
+         'Current Condition', 'Address', 'Region', 'Remark', 'Township')
+data <- lapply(detainees.clean[cols], factor)
+
+library(questionr)
+library(knitr)
+missing <- freq.na(detainees.clean) %>% 
+  kable(col.names = c('Count Missing','Percent Missing'), caption = "# of Missing Values Per Variable")
+missing
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+sex.count <- detainees.clean %>% group_by(Sex) %>% count() %>% filter(Sex=='F' | Sex=='M') %>%
+  kable(col.names = c('Sex', 'Count'))
+sex.count
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+levels.count <- sapply(detainees.clean, function(x) length(unique(x)))%>%
+  kable(col.names = c('Number of Levels'), caption='Number of Levels Per Column')
+levels.count
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+sex.df <- detainees.clean %>% filter((Sex=='F' && is.na(Township) == FALSE)|(Sex=='M'&& is.na(Township) == FALSE)) %>%
+  filter((Sex=='F'|Sex == 'M'))
+
+sex.prop <- table(sex.df$Sex, sex.df$Region)
+
+sex.prop <-prop.table(sex.prop, 2)  %>% `*`(100) %>% round(2) %>%
+  kable(caption = 'Sex Breakdown of Detainees by Region')
+sex.prop
+```
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+library(modelsummary)
+cat.desc <- detainees.clean%>%
+  datasummary_skim(data=., type="categorical",
+                   title="Count and Distribution of Key Categorical Variables")
+
+cat.desc
+```
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+#cols <- c('Sex', 'Status')
+#detainees.clean[cols] <-lapply
+
+sex.df <- detainees.clean %>% filter(Sex=='F'|Sex=='M')
+
+occup.prop <- table(sex.df$Sex, sex.df$Status)
+
+occup.prop <-prop.table(occup.prop, 2)  %>% `*`(100) %>% round(2) %>%
+  kable(caption = 'Sex Distribution of Detainees by Occaption', padding=30)
+occup.prop
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+date.detained.sex <- ggplot(sex.df, aes(x=sex.df$'Date Detained', color = Sex)) +
+  geom_histogram(stat="count") +
+  labs(title="Figure 0:\nDate Detained by Sex",x="Date Detained", y = "Count")
+
+date.detained.sex
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(knitr)
+
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+# Step One: Load in the Data
+
+# Indicators data
+# 1. protests (ACLED)
+conflicts = read_csv("https://www.andrew.cmu.edu/user/jweiss2/21f_r/94842/final_2021/conflicts.csv.gz")
+
+# 2. sectors (MIMU)
+## readxl doesn't read from urls, so this is a workaround:
+tmp = tempfile(fileext = ".xlsm")
+httr::GET(
+  url = "https://www.andrew.cmu.edu/user/jweiss2/21f_r/94842/final_2021/MIMU_BaselineData_AllSectors_Countrywide_18Mar2021_revised.xlsm", 
+  httr::write_disk(tmp)
+)
+sector.indicators = 
+  readxl::read_xlsx(tmp, sheet=3, skip = 5) %>% as_tibble()
+
+
+### Organize all sectors data to be given by nested tibbles per indicator
+sector.nest <- sector.indicators %>% 
+  select(1:3, 
+         Indicator_Name, Indicator_Type, Sector, Unit, 
+         starts_with("20"), Source_Name) %>%
+  mutate(Indicator = paste(Indicator_Name, Indicator_Type, 
+                           Sector, Unit, Source_Name, sep="|")) %>%
+  select(1:3, Indicator, starts_with("20")) %>%
+  pivot_longer(cols = starts_with("20"), 
+               names_to = "Year", 
+               values_to="Value") %>%
+  filter(!is.na(Value)) %>%
+  nest(data = -Indicator) %>%
+  separate(Indicator, sep="\\|", 
+           into = c("Indicator_Name", "Indicator_Type",
+                    "Sector","Unit","Source_Name")) 
+
+sector.nest
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+
+
+# We can use the Levenshtein distance to find approximate matches at the township level.
+
+#' level computes the levenshtein distance between x and each y and returns
+#' the ones that are within k of the smallest value as an ordered vector. 
+#' See ?adist for details.
+#' @return data.frame of hits
+leven = function(x, y, k=0, ignore.case=T) {
+  data.frame(y=y) %>%
+    as_tibble() %>%
+    
+    # compute Levenshtein distance for string x for each y
+    mutate(distance = utils::adist(x, y, 
+                                   ignore.case=ignore.case) %>% .[1,]) %>%
+    
+    # keep y's within k of the best match
+    filter(distance <= min(distance, na.rm=T) + k) %>%
+    mutate(distance.per.char = distance/nchar(y))
+}
+
+# Use `leven` for string *vectors* `x` and `y`
+apply_leven = function(x, y, k=0, distance.threshold=0.3, ignore.case=F) {
+  data.frame(x=x) %>%
+    # get potential matches for each x as a list of tibbles
+    mutate(leven.df = map(x, ~ leven(.x, y=y,
+                                     k=k, ignore.case=ignore.case))
+    ) %>%
+    unnest(everything()) %>%
+    mutate(is.match=distance.per.char < distance.threshold) %>%
+    
+    # order by best match
+    arrange(distance.per.char) %>%
+    
+    # keep the best match per `x`
+    group_by(x) %>% 
+    slice(1) %>%  
+    ungroup() %>%
+    
+    # convert non-matches to Other
+    mutate(y = ifelse(is.match, y, "Other"))  
+}
+
+
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+
+# First, let's standardize the naming of the "admin3" column in this dataset to Township_Name
+head(conflicts)
+colnames(conflicts)
+conflicts <- conflicts %>% rename("Township_Name" = "admin3")
+
+conflicts %>% select(event_type) %>% unique() # We learn that there are 6 unqiue codes in this dataset: 
+# Battles, explosions/remote violence, strategic developments, protests, violence against civilians, riots
+conflict_levels <- factor(c("Battles", "Explosions/Remote violence",
+                                                               "Violence against civilians", "Protests", 
+                                                               "Riots", "Strategic Developments") ) 
+
+
+conflicts <- conflicts %>% mutate(event_type= factor(event_type, # Make the event-type a categorical variable 
+                                                     levels= conflict_levels) )  %>% 
+  select(event_type, fatalities, Township_Name) 
+  
+conflicts
+  
+
+
+# Let's quickly examine missingness: 
+conflicts %>% count(is.na(.$event_type))
+# We have 2689 rows where the event_type is NA / missing.
+# As we see below, only 13 of those rows are associated with a fatality
+# However, dropping that many rows could impact this dataset. 
+# Therefore, I am keeping the NA's in at this stage.
+
+conflicts %>% filter(is.na(.$event_type)) %>% summarize(fatality_ct= sum(fatalities))
+# Only 13 fatalities are associated with rows with missing event types.
+
+
+# Let's visualize overall fatality count associated with various event types: 
+# We will exclude those NA rows because, although there are many NA rows, the 
+# overall fatality count associated with those row
+conflicts %>% group_by(event_type) %>% 
+  summarize(fatality_ct= map_dbl(., ~ sum(fatalities) )) %>% 
+  #filter(!is.na(event_type)) %>% 
+  unique() %>% kable() 
+
+
+
+```
+
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+
+# Let's create some plots
+conflicts.filtered <- conflicts %>% filter(!is.na(event_type)) 
+
+fatality.conflicts.plot <- ggplot(data= conflicts.filtered, 
+                 aes(x= event_type,
+                     y= fatalities) )+ geom_bar(stat="identity", color="darkgreen") +
+  theme(axis.text.x=element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  ylab("Fatality Count") + # Changes y-axis label
+  xlab("Interaction Type")  + # Changes x-axis label
+  ggtitle("Figure 5:\nFatality Count by Interaction Type")
+
+fatality.conflicts.plot
+
+# Pull out fatalities by event type 
+event.fatality.ct <- conflicts %>% group_by(event_type) %>% 
+   filter(!is.na(event_type)) %>% 
+  summarize(fatality_ct= map_dbl(., ~ sum(fatalities) )) %>% 
+  unique()  
+  
+battle.fatality <- event.fatality.ct$fatality_ct[1]
+violence.ctzn.fatality <- event.fatality.ct$fatality_ct[3]
+explosion.fatality <- event.fatality.ct$fatality_ct[2]
+protest.fatality <- event.fatality.ct$fatality_ct[4]
+event.fatality.ct
+
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+
+# Approach: Let's grab the indicators that we need and put each indicator into its own dataframe.
+# We will select only those columns we need / that offer meaningful value so that our final
+# joined dataframe is as unwieldy as possible and has as little duplicative information as possible. 
+# Then, we will join all of these indicator-level MIMU dataframes into one combined MIMU indicator 
+# dataframe. In turn, this will be joined with the cleaned ACLED dataset. While we need a final joined 
+# dataframe for running various regressions and tests, some of our analysis will be performed using just the values 
+# in a single, indicator-level dataframe (E.g., our t-test compares gender differences in literacy rates per region).
+# As such, we will use the indicator-level dataframe to perform those tasks, reserving the combined dataframe for tasks that 
+# require it. If our indicator-level code changes/we do further cleaning and inspection, this will be chained and fed up to our 
+# joined dataframe, meaning we have computational continuity. 
+
+# Township Sizes Dataframe: 
+township.sizes = sector.nest %>% 
+  filter(Indicator_Name== "Population size", 
+         Indicator_Type== "Total", 
+         str_detect(Source_Name, "Census")) %>%
+  unnest(everything()) %>% 
+  rename(Population= Indicator_Name,   # Let's rename the cols with more meaningful names
+         Pop_size= Value) %>%   # This will make things easier, too, when we join all of the MIMU mini-sets
+  select(Population, Pop_size, Township_Name) # Select only columns we need 
+
+township.sizes 
+
+
+
+
+```
+
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+# Repeat the process, but for this indicator: 
+
+# Monastic Primary Education Dataframe: 
+monastic.primary.edu <- sector.nest %>% 
+  filter(Indicator_Name== "Monastic school students (Primary)", 
+         Indicator_Type== "Total", 
+         str_detect(Source_Name, "Monastic")) %>%
+  unnest(everything()) %>% 
+  filter(Year=="2014-2015") %>% 
+  rename(Monastic_Primary= Indicator_Name,   # Let's rename the cols with more meaningful names
+         Mon_Prim_Ttl= Value) %>%   # This will make things easier, too, when we join all of the MIMU mini-sets
+  select(Monastic_Primary, Mon_Prim_Ttl, Township_Name) # Select only columns we need 
+
+
+monastic.primary.edu 
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+
+# Let's do the same thing for Gender Literacy Rates
+# Here, I've classified gender as factor variables, with "Male" as the base value 
+# Factoring the variable can help us in the regressions 
+gender.literacy <- sector.nest %>% 
+  filter(Indicator_Name== "Adult literacy rate", 
+         Indicator_Type== "Female" | Indicator_Type=="Male",
+         str_detect(Source_Name, "Census") ) %>%
+  mutate(Gender= factor(Indicator_Type, levels= c("Male", "Female")) ) %>% 
+  unnest() %>% 
+  rename(Gender_Lit= Indicator_Name,   # Let's rename the cols with more meaningful names
+         Lit_Rate= Value) %>%   # This will make things easier, too, when we join all of the MIMU mini-sets
+  select(Gender_Lit, Lit_Rate, Gender, Township_Name, State_Region) # Select only columns we need 
+
+gender.literacy
+
+
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+
+
+# Let's do the same thing for Primary Schools 
+primary.schools <- sector.nest %>% 
+   filter(Indicator_Name== "Primary schools", 
+         Indicator_Type== "Total", 
+         str_detect(Source_Name, "DBE")) %>%
+  unnest(everything()) %>% 
+  filter(Year== "2014-2015") %>% 
+  rename(Primary_School= Indicator_Name, 
+         Prim_Schl_Ct= Value) %>% 
+  select(Primary_School, Prim_Schl_Ct, Township_Name)
+
+
+primary.schools 
+
+
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+
+# Let's do the same thing for Overall Lit Rate  
+total.lit.rate <- sector.nest %>% 
+   filter(Indicator_Name== "Adult literacy rate", 
+         Indicator_Type== "Total", 
+         str_detect(Source_Name, "Census")) %>%
+  unnest(everything()) %>% 
+  rename(Overall_Lit_Rate = Indicator_Name, 
+         Ttl_Lit_Rate= Value) %>% 
+  select(Overall_Lit_Rate, Ttl_Lit_Rate, Township_Name)
+
+
+total.lit.rate
+
+```
+
+
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+# The education levels will recur a bit more processing, so I've split this block of 
+# code into its own separate chunk for legibility. 
+
+# Note: for the highest level of education indicator, I have pulled out a number of categories: 
+# Diploma, HS, Middle School, None, Post-grad and above, and Primary School
+# I then coded these factor variables, setting "Post grad and above" as the base variable,
+# with the assumption that there was an inherent ordering to the categories in terms of 
+# years of education completed.
+
+
+# Set our Factor levels to feed into dataframe below 
+edu.levels= factor(c("Post-graduate and above - Total", "University/ College - Total", "Vocational training - Total", "Diploma - Total", "High school - Total", "Middle school - Total", "Primary school - Total", "None - Total") )
+
+
+highest.lvl.edu <- sector.nest %>%
+  filter(Indicator_Name== "Population 25 yr and over by highest level of educaiton completed",
+         Indicator_Type== "Diploma - Total" | Indicator_Type==  "High school - Total" |
+            Indicator_Type== "Middle school - Total" |  Indicator_Type== "None - Total" |
+            Indicator_Type== "Post-graduate and above - Total" |  Indicator_Type== "Primary school - Total" |  Indicator_Type==  "University/ College - Total" |  Indicator_Type==  "Vocational training - Total",
+         str_detect(Source_Name, "Census") ) %>% unnest() %>%
+ mutate(Edu_Factors= factor(Indicator_Type, levels= edu.levels)) %>% 
+  arrange(Edu_Factors) %>% 
+  rename(Edu_Level= Indicator_Type, 
+         Edu_Level_Ct= Value) %>% 
+  select(Edu_Factors, Township_Name, Edu_Level_Ct)
+
+
+highest.lvl.edu
+
+
+```
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+
+# Now that we've pulled out the indicators we're interested in and saved each into a dataframe of its own,
+# let's join all of the dataframes. We will use the result of these joined dataframes with the ACLED indicator 
+# dataset, to be used in our regression models later on. 
+
+mimu.joined <- highest.lvl.edu %>% 
+  inner_join(township.sizes, by= c("Township_Name"= "Township_Name")) %>% 
+  inner_join(primary.schools, by= c("Township_Name"= "Township_Name")) %>%
+  inner_join(monastic.primary.edu, by= c("Township_Name"= "Township_Name")) %>%
+  inner_join(gender.literacy, by= c("Township_Name"= "Township_Name")) %>% 
+  inner_join(total.lit.rate, by= c("Township_Name"="Township_Name"))
+  
+
+# Now that we've joined all our MIMU indicators, let's join with our conflicts indicators
+# Because we've changed admin3 from Conflicts to Township_Name, we can use Township_Name to join both 
+
+
+indicators.joined <- mimu.joined %>% 
+  inner_join(conflicts, by= c("Township_Name"= "Township_Name") )
+
+indicators.joined
+
+
+```
+
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+
+# Let's visualize the highest level of education completed for adults over 25
+
+
+edu.completed <- ggplot(data= highest.lvl.edu, 
+                 aes(x= Edu_Factors,
+                     y= Edu_Level_Ct) )+ geom_bar(stat="identity", color="darkred") +
+  theme(axis.text.x=element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  ylab("Population Count") + # Changes y-axis label
+  xlab("Highest Level of Education Completed")  + # Changes x-axis label
+  ggtitle("Figure 3:\nHighest Level of Education Completed, Population 25 and Older")
+
+edu.completed 
+
+edu.comp.tbl <- highest.lvl.edu %>% 
+  group_by(Edu_Factors) %>% 
+  summarize(Total= map_dbl(., ~sum(Edu_Level_Ct))) %>% 
+  unique() 
+
+
+primary.lvl.ct <- edu.comp.tbl$Total[7]
+none.lvl.ct <- edu.comp.tbl$Total[8]
+college.lvl.ct <- edu.comp.tbl$Total[2]
+
+
+
+```
+
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+
+gender.lit.gap <- gender.literacy %>% group_by(State_Region) %>% 
+  summarize(results= list(t.test(Lit_Rate[Gender=="Male"],
+                            Lit_Rate[Gender=="Female"])) ) %>% 
+  mutate(`Difference in Proportion Means` = map_dbl(results, ~.x[["estimate"]][1]-.x[["estimate"]][2]) ) %>% 
+              mutate(`Lower Threshold`= map_dbl(results, ~.x[["conf.int"]][1] )) %>% 
+              mutate(`Upper Threshold`= map_dbl(results, ~.x[["conf.int"]][2] )) %>% 
+              mutate(`P-Value`= map_dbl(results, ~.x[["p.value"]]) ) %>% 
+              select(State_Region, `Difference in Proportion Means`, `Lower Threshold`, `Upper Threshold`, `P-Value`)  %>% mutate_if(is.numeric, round, 3) %>% rename(Region= State_Region)
+
+
+gender.lit.gap %>% kable() 
+
+
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+gender.lit.table.mean <- gender.literacy %>% 
+  group_by(Gender) %>% summarize(`Mean Literacy Rate`= map_dbl(., ~mean(Lit_Rate) ) ) %>% 
+  unique() %>% kable(caption= "Figure 1.2: Mean Literacy Rates by Gender", digits= 1) 
+#summarize(fatality_ct= map_dbl(., ~ sum(fatalities) )) %>% 
+  #filter(!is.na(event_type)) %>% 
+  #unique() %>% kable() 
+
+gender.lit.table.mean
+
+
+gender.lit.table.median <- gender.literacy %>% 
+  group_by(Gender) %>% summarize(`Median Literacy Rate`= map_dbl(., ~median(Lit_Rate) ) ) %>% 
+  unique() %>% kable(caption= "Figure 1.3: Median Literacy Rates by Gender", digits= 1) 
+
+gender.lit.table.median 
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+
+ppn.lit.fatal.trivar <- ggplot(data= indicators.joined,
+                    aes(y= Pop_size, x= Ttl_Lit_Rate, size= fatalities) ) + 
+               geom_point(alpha=0.5) +  stat_smooth(method= "lm") + 
+  ylab("Population Size") + # Changes y-axis label
+  xlab("Literacy Rate")  + # Changes x-axis label
+  ggtitle("Figure 4:\nLiteracy Rate vs. Population Size") 
+
+ppn.lit.fatal.trivar  
+
+
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+gender.lit.table.mean <- gender.literacy %>% 
+  group_by(Gender) %>% summarize(`Mean Literacy Rate`= map_dbl(., ~mean(Lit_Rate) ) ) %>% 
+  unique() %>% kable(caption= "Figure 1.2: Mean Literacy Rates by Gender", digits= 1) 
+#summarize(fatality_ct= map_dbl(., ~ sum(fatalities) )) %>% 
+  #filter(!is.na(event_type)) %>% 
+  #unique() %>% kable() 
+
+gender.lit.table.mean
+
+
+gender.lit.table.median <- gender.literacy %>% 
+  group_by(Gender) %>% summarize(`Median Literacy Rate`= map_dbl(., ~median(Lit_Rate) ) ) %>% 
+  unique() %>% kable(caption= "Figure 1.3: Median Literacy Rates by Gender", digits= 1) 
+
+gender.lit.table.median 
+```
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+
+gender.lit.gap <- gender.literacy %>% group_by(State_Region) %>% 
+  summarize(results= list(t.test(Lit_Rate[Gender=="Male"],
+                            Lit_Rate[Gender=="Female"])) ) %>% 
+  mutate(`Difference in Proportion Means` = map_dbl(results, ~.x[["estimate"]][1]-.x[["estimate"]][2]) ) %>% 
+              mutate(`Lower Threshold (0.025)`= map_dbl(results, ~.x[["conf.int"]][1] )) %>% 
+              mutate(`Upper Threshold (0.975)`= map_dbl(results, ~.x[["conf.int"]][2] )) %>% 
+              mutate(`P-Value`= map_dbl(results, ~.x[["p.value"]]) ) %>% 
+              select(State_Region, `Difference in Proportion Means`, `Lower Threshold (0.025)`, `Upper Threshold (0.975)`, `P-Value`)  %>% mutate_if(is.numeric, round, 3) %>% rename(Region= State_Region)
+
+
+gender.lit.gap %>% 
+  kable(caption= "Figure 1: Difference in Literacy Rate Proportions Means between Genders") 
+
+# Get the pvals and lower, upper bounds for Kayah and Kayin, 
+# which have very low significance 
+
+# Kayah Region: 
+kayah.pval <- gender.lit.gap$`P-Value`[6]
+kayah.lower <- gender.lit.gap$`Lower Threshold (0.025)`[6]
+kayah.upper <- gender.lit.gap$`Upper Threshold (0.975)`[6]
+kayah.mean <- gender.lit.gap$`Difference in Proportion Means`[6]
+
+# Kayin Region: 
+kayin.pval <- gender.lit.gap$`P-Value`[7]
+kayin.lower <- gender.lit.gap$`Lower Threshold (0.025)`[7]
+kayin.upper <- gender.lit.gap$`Upper Threshold (0.975)`[7]
+kayin.mean <- gender.lit.gap$`Difference in Proportion Means`[7]
+
+# This counts the number of regions that are not significant 
+# at a p-value threshold of 0.05. 
+insignif.count <- gender.lit.gap %>% filter(`P-Value` > 0.05) %>% count()
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+nested.fall = fallen %>% nest(data=-Township)
+nested.det = detainees.clean %>% nest(data=-Township)
+
+### Use the following code
+joined.det.fal = nested.det %>%
+  inner_join(apply_leven(nested.det$Township, 
+                         nested.fall$Township,
+                         distance.threshold=0.28),
+             # 0.28 eliminates the common incorrect 
+             # match of Yangon --> Ywangan
+             by=c("Township"="x")
+  ) %>%
+  rename(detainee_township=Township, fallen_township=y)
+
+joined.det.fal = joined.det.fal %>%
+  left_join(nested.fall, by=c("fallen_township"="Township")) %>%
+  rename(data_fallen = data.y,
+         data_detain = data.x)
+
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+detainees.count <- detainees.clean %>% group_by(Township) %>%
+  count() %>% rename(detainee.n=n)
+
+det.count.joined = detainees.count %>%
+  inner_join(apply_leven(.$Township, 
+                         township.sizes$Township_Name,
+                         distance.threshold=0.28),
+             # 0.28 eliminates the common incorrect 
+             # match of Yangon --> Ywangan
+             by=c("Township"="x")
+  ) %>%
+  rename(MIMU_township=y)
+
+det.count.joined = det.count.joined %>% filter(is.match=='TRUE')
+
+detainee.count.lit = gender.literacy%>%
+  left_join(det.count.joined, by=c("Township_Name"="MIMU_township"))
+
+lit.det.plot <- ggplot(detainee.count.lit, aes(x = Lit_Rate, y = detainee.n))
+
+lit.det.plot <- lit.det.plot + geom_point() + facet_grid(. ~Gender) + ggtitle("Figure 2:\nNumber of Detainees by Literacy Rate and Sex")
+
+lit.det.plot
+```
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+matchColClasses <- function(df1, df2) {
+
+  sharedColNames <- names(df1)[names(df1) %in% names(df2)]
+  sharedColTypes <- sapply(df1[,sharedColNames], class)
+
+  for (n in sharedColNames) {
+     class(df2[, n]) <- sharedColTypes[n]
+  }
+
+  return(df2)
+ }
+```
+
+```{r include=FALSE, warning=FALSE, echo=FALSE}
+matchColClasses(indicators.joined, det.count.joined)
+
+indicators.joined <- indicators.joined %>% select('Township_Name', 'Edu_Level_Ct', 'Prim_Schl_Ct', 'Mon_Prim_Ttl','Gender_Lit', 'Lit_Rate', 'Gender')
+indicators.joined <- indicators.joined %>% group_by('Township_Name')
+
+det.count.ind <- det.count.joined %>%
+  left_join(indicators.joined, by=c('MIMU_township'='Township_Name')) %>%
+  select('MIMU_township', 'Prim_Schl_Ct', 'Mon_Prim_Ttl','detainee.n') %>%
+  unique()
+
+det.count.ind <- det.count.ind %>%
+  left_join(township.sizes, by=c('MIMU_township'='Township_Name'))
+            
+```
+# An Analysis of Detainment Patterns During the Myanmar Coup of 2021
+
+
+# Trigger Warning 
+
+Please note that this report discusses genocide, violence, and other difficult topics. We urge our readers to take care and practice generosity with themselves as they work their way through this document.
+
+# Abstract: 
+
+This report analyzes the relationship among gender, education, and detainee and fatality counts in the months following the coup in Myanmar. Education can be an incredibly  important predictive factor. In fact, previous studies have shown that education can decrease violence (see: The Effect of Education on Crime: Evidence from Prison Inmates, Arrests, and Self-Reports (berkeley.edu)). While the context of this study and our own is different (Myanmar vs. USA; schooling and crime vs. education levels and detainee count), we hypothesize that higher levels of education and literacy rates, in general, will be associated with lower rates of detainee and fatality count. We test this assumption through various statistical models, tests, and visualizations. We ultimately determine that our initial assumptions did not hold true, information which can be impactful for policymakers and stakeholders in its own right.
+
+# Introduction:
+
+On February 1, 2021, Myanmar’s military (called the Tatmadaw) executed a coup, overthrowing the country’s democratically-elected government. Peaceful protests and civil disobedience ensued. The military has since cracked down on such protests with greater and greater force. Senior General Min Aung Hlaing, an army chief, is now the country’s leader and de facto dictator. It’s important to note that Myanmar’s foray into democracy was short lived; the military has long been a strong force in the country. In fact, 2011 marked the first year in recent history in which the Tamadaw allowed democratic elections, and other reforms, such as labor laws, were also instituted at this time. Yet even under democratic governments, the Tatmadaw retained significant power. 
+
+In 2016, Aung San Suu Kyi became Myanmar’s effective leader. Her party, the National League of Democracy, is widely popular in the country, and she is a noted human rights activist and Nobel Peace Prize recipient. However, in 2017, the majority-Buddhist country drew international attention for the genocide of its Rohingya Muslim population, toward which Aung San Suu Kyi appeared ambivalent at various hearings, including a May 2021 UN hearing. This crisis is ongoing, and over 700,000 Rohingya people have fled as refugees to Bangladesh. 
+
+The situation in Myanmar is clearly dynamic and complex, and various factors—political, religious, historical—are in play. This report focuses on indicators related to education and gender to identify and explore potential relationships with detainee and fatality counts resulting from the coup. Studies have shown that education can decrease violence (e.g., The Effect of Education on Crime: Evidence from Prison Inmates, Arrests, and Self-Reports (berkeley.edu). The context between this study and Myanmar is clearly different, but we take education as a generally important predictive factor that deserves deep analysis, which our report will give to the subject. 
+
+While we hypothesize that higher rates of education and literacy rates may be associated with lower rates of detainment and fatality, we acknowledge that it’s also possible that townships with higher education and literacy rates could experience greater instances of detainment and violence. That is, more educated people may be more able and willing to protest injustice and may have lesser fear of negative consequences resulting from their actions due to greater resources. Our report aims to tease apart some of these questions by examining the relationship among gender, education, and counts of detainees and fatalities resulting from conflicts.
+
+To gain a better understanding of the dynamics of detainment, we conduct an initial exploratory analysis of the dates individuals were detained by sex. The graph below suggests that many individuals were detained in April, and the rate of detainment fluctuated significantly throughout the months of April-October. Additionally, there were more male detainees, and the ratio of male to female detainees seemed to be relatively constant throughout this sample period.
+
+```{r, echo=TRUE, warning=FALSE}
+date.detained.sex
+```
+
+# Methods: 
+
+Please see below for summaries of missingness per variable in the Detainees dataset. As the table visualizes, there are a significant number of datapoints missing for some variables, particularly the plaintiff variable where much of the data is missing. 
+
+```{r, echo=TRUE, warning=FALSE}
+missing
+```
+
+We also summarize the number of levels per variable  and proportion of each level to better understand the homogeneity of the Detainees dataset.
+
+```{r, echo=TRUE, warning=FALSE}
+levels.count
+
+cat.desc
+```
+
+***Cross Tabulation***: 
+
+We conduct several cross tabulations in our initial analysis to familiarize ourselves with the distribution of various indicators. For example we cross-tabulated proportion of detainees by region and sex, and by occupation and sex.
+
+***T-Test***: 
+
+We ran a two-sample t-test to measure the difference in literacy rates between genders across region. A t-test was appropriate in this context because we had two different samples (Male, Female). Further, we performed the t-test at the region level, which encompasses a wider swath of the population than the township level, and we therefore assumed that there were more than enough male and female samples per region to satisfy the sample size criteria associated with this test.
+
+***Trivariate Figure***: 
+
+We created a trivariate figure with literacy rate on the x-axis, population size on the y-axis, and the size of each township-level datapoint determined by the number of fatalities from ACLED conflicts. We were interested in exploring how population size varied by literacy rate—did higher-population townships have higher literacy rates? We sized the dots by the number of fatalities from conflicts to gauge if there were clustering patterns among higher-fatality townships based on these other indicators. We considered it possible that larger townships have higher literacy rates, but lower fatality counts and anticipated clustering patterns as such.  
+
+***Regressions***: 
+
+We use linear regression to examine the relationship between education indicators and detainee count. We conduct two linear regressions. The first looks at the effect of primary school count and population size on the number of detainees. The second adds the count of monastic primary education, a potential proxy for the religiosity of the township.
+
+
+# Results and Discussion:
+
+```{r, echo=TRUE, warning=FALSE}
+sex.prop
+```
+
+The proportion of male detainees far exceeds female detainees. A cross tabulation of the proportion of detainees by sex and region shows that this trends holds true in most regions, although the split varies by region. Notably, in certain regions like Kayah, Magew, and Yangon, the the proportion of female detainees is below 15 percent. Meanwhile, in other regions like Rackine and Kayin, the proportion of female detainees is greater than 30 percent.
+
+```{r, echo=FALSE, warning=FALSE}
+
+gender.lit.gap.tbl <- gender.lit.gap %>% 
+  kable(caption= "Figure 1: Difference in Literacy Rate Proportions Means between Genders")
+```
+
+
+```{r, echo=TRUE, warning=FALSE}
+gender.lit.gap.tbl 
+
+```
+
+The relationship between the difference in mean literacy rates between genders varies by region (Figure 1). For the majority of regions, the difference between gender literacy rate means is statistically significant at a p-value threshold of 0.05. In fact, for many zip codes, the p-value is effectively 0, indicating high significance. However, the difference is not statistically significant for `r insignif.count`. In fact, for the Kayah and Kayin Regions, the difference in literacy rates means is highly insignificant (Kayah: p= `r kayah.pval`, CI: [`r kayah.lower`, `r kayah.upper`]; Kayin: `r kayin.pval`, CI: [`r kayin.lower`, `r kayin.upper`]), suggesting that there is not a significant difference among literacy rates by genders in these regions. For additional context, we have provided the mean literacy rate below, as well as the median (Figures 1.2 and 1.3, respectively). There is notable variation between mean and median literacy rates per gender. This could suggest that a few regions have lower literacy rates, which in turn weighs down the mean, whereas the median is relatively unaffected by these outlier  regions with low values. Compared to global literacy rates,  Myanmar’s mean male literacy rate is on par with the global average, while the mean female rate is about 4 percentage points below the global average (averages sourced from World Bank: https://data.worldbank.org/indicator/SE.ADT.LITR.ZS.
+
+```{r, echo=TRUE, warning=FALSE}
+gender.lit.table.mean
+gender.lit.table.median
+```
+
+We corroborate this finding with a graphical representation of the relationship between detainee count and literacy rate by gender (Figure 2). It appears that there might be more variation in Female literacy rates among townships. Despite this broader spread of literacy rates, the relationship between detainee count and literacy rate does not seem to differ dramatically by gender. 
+
+```{r, echo=TRUE, warning=FALSE}
+lit.det.plot
+```
+```{r, echo=TRUE, warning=FALSE}
+edu.completed
+```
+
+Interestingly, while literacy rates are generally high, the highest level of education attained among the Burmese population aged 25 and older is concentrated among lower levels (Figure 3). For example, the count of individuals completing primary school only is `r `primary.lvl.ct` and those completing no education is `r none.lvl.ct`,  whereas the count of individuals completing college is `r college.lvl.ct`. This could partially be explained by the fact that basic literacy can be attained in lower grade levels. Thus, attaining higher levels of education may not—and in this case, does not—appear to be a barrier to achieving overall literacy rates that are generally on par with the global average.
+
+```{r, echo=TRUE, warning=FALSE}
+ppn.lit.fatal.trivar 
+```
+
+We analyzed how literacy rates vary with population size, sizing each datapoint based on the number of fatalities in a given region (Figure 4). In general, as literacy rate increases, so, too, does population size. This could be explained by the fact that higher population sizes are often associated with urban areas, where access to schooling is more readily available. Despite this relationship, a clustering pattern among fatality counts from conflicts does not emerge. That is, there is not a clear inter-relationship among population size, literacy rates, and number of fatalities at the township level from this visualization. As discussed above, literacy rates in Myanmar, on average, are fairly concentrated, which may explain this phenomenon.
+
+```{r, echo=TRUE, warning=FALSE}
+fatality.conflicts.plot
+```
+
+Next, we examined the frequency of fatality counts by different ACLED interaction types (Figure 5). It is immediately apparent that battles have the highest fatality count, at `r battle.fatality`. Violence against citizens and explosions/remote violence have similar fatality counts, at `r violence.ctzn.fatality` and `r explosion.fatality`. While protests are associated with comparatively fewer fatalities (`r protest.fatality` individuals), it is important to note that ACLED classifies protests as: 1) peaceful protests; 2) protest with intervention; 3) excessive force against protesters. That nearly 400 people lost their lives to protest against the military dictatorship is a strong indication that civil rights, liberties, and free speech are being curtailed. 
+
+***Regression Model 1:***
+
+This regression looking at the effect of Primary School count `Prim_Schl_Ct`, and population size `Pop_size` on the number of detainees: `detainee.n ~ Prim_Schl_Ct + Pop_size`.
+
+```{r, echo=FALSE, warning=FALSE}
+detainee.lm <- lm(detainee.n ~ Prim_Schl_Ct + Pop_size, data = det.count.ind)
+```
+
+```{r, echo=TRUE, warning=FALSE}
+summary(detainee.lm)
+```
+
+The regression is not a great fit for the data (R2 = `r round(summary(detainee.lm)$r.squared, 4)`) (Summary above). 
+
+Although is not a great representation of the data, it shows that primary school count `Prim_Schl_Ct` is negatively correlated to the number of detainees `detainee.n`; for every additional primary school in a town, there is a `r summary(detainee.lm)$coef['Prim_Schl_Ct', 'Estimate']` decrease in the number of detainees (Summary above). This correlation is statistically significant, as the p-value is `r summary(detainee.lm)$coef['Prim_Schl_Ct', 'Pr(>|t|)']` (Summary above). 
+
+Additionally, population size `Pop_size` has a positive correlation with the number of detainees `detainee.n`; for every additional person in a town, there is a `r summary(detainee.lm)$coef['Pop_size', 'Estimate']` increase in the number of detainees (Summary above). This correlation is statistically significant, as the p-value is `r summary(detainee.lm)$coef['Pop_size', 'Pr(>|t|)']` (Summary above).
+
+***Regression Model 1: Assessments for Collinearity:*** 
+
+```{r, echo=FALSE, warning=FALSE}
+library(GGally)
+
+model1.var.names <- c("Prim_Schl_Ct","Pop_size")
+```
+
+```{r, echo=TRUE, warning=FALSE}
+ggpairs(det.count.ind[,c(model1.var.names)], axisLabels = "internal")
+```
+
+There are possible correlations between our indicators in the model 1 regression. It looks like there is a positive correlation between population size and primary school count (Figure Above). TO verify this, we can conduct a correlation test. 
+
+```{r, echo=FALSE, warning=FALSE}
+cortest1 = cor.test(det.count.ind$Prim_Schl_Ct, det.count.ind$Pop_size)
+```
+```{r, echo=TRUE, warning=FALSE}
+cortest1
+```
+There is a significant correlation of `r cortest1$estimate` between population size and primary school count (Correlation test above). Thus, our next model will remove population size from the regression model, and we will see if this will increase the accuracy of our regression by removing collinearity.
+
+
+Based on these assessments, we will see if our new, more simplified model that is free from collinearity is more accurate or effective than our original model.
+
+```{r, echo=FALSE, warning=FALSE}
+detainee.lm2 <- update(detainee.lm, . ~ . - Pop_size)
+```
+```{r, echo=TRUE, warning=FALSE}
+summary(detainee.lm2)
+```
+
+```{r, echo=FALSE, warning=FALSE}
+comparison1 = list(full.model=detainee.lm,
+     mini.model=detainee.lm2) %>%
+  modelsummary(statistic = NULL, stars = T)
+```
+
+```{r, echo=TRUE, warning=FALSE}
+comparison1
+```
+
+Our new simpler model has a significantly lower R2, from `r round(summary(detainee.lm)$r.squared,4)` to `r round(summary(detainee.lm2)$r.squared,4)` (Model summary above). It also shows that Primary school count `Prim_Schl_Ct` has a smaller negative correlation of `r round(summary(detainee.lm2)$coef['Prim_Schl_Ct', 'Estimate'],3)` (yet also significant) on the number of detainees `detainee.n` (P-value = `r summary(detainee.lm2)$coef['Prim_Schl_Ct', 'Pr(>|t|)']`) (Model summary above). 
+
+***Regression Model 2:***
+
+This regression model is looking at the effect of primary school count `Prim_Schl_Ct`, population size `Pop_size`, and monastic primary education `Mon_Prim_Ttl` totals on the number of detainees `detainee.n`. This is looking at possible religious influences by accounting for the number of monastic schools as well: `detainee.n ~ Prim_Schl_Ct + Pop_size + Mon_Prim_Ttl`
+
+```{r, echo=FALSE, warning=FALSE}
+
+detainee2.lm <- lm(detainee.n ~ Prim_Schl_Ct + Pop_size + Mon_Prim_Ttl, data = det.count.ind)
+
+```
+```{r, echo=TRUE, warning=FALSE}
+summary(detainee2.lm)
+
+```
+The regression is not a great fit for the data (R2 = `r round(summary(detainee2.lm)$r.squared,4)`) (Summary above). 
+
+Although is not a great representation of the data, it shows that primary school count `Prim_Schl_Ct` is negatively correlated to the number of detainees `detainee.n`; for every additional primary school in a town, there is a `r summary(detainee2.lm)$coef['Prim_Schl_Ct', 'Estimate']` decrease in the number of detainees (Summary above). This correlation is statistically significant, as the p-value is `r summary(detainee2.lm)$coef['Prim_Schl_Ct', 'Pr(>|t|)']` (Summary above). 
+
+Additionally, population size `Pop_size` has a positive correlation with the number of detainees `detainee.n`; for every additional person in a town, there is a `r summary(detainee2.lm)$coef['Pop_size', 'Estimate']` increase in the number of detainees (Summary above). This correlation is statistically significant, as the p-value is `r summary(detainee2.lm)$coef['Pop_size', 'Pr(>|t|)']` (Summary above).
+
+Finally, monastic primary education count `Mon_Prim_Ttl` has a negative correlation with the number of detainees `detainee.n`: for every additional person in a town, there is a `r summary(detainee2.lm)$coef['Mon_Prim_Ttl', 'Estimate']` decrease in the number of detainees (Summary above). This correlation is statistically significant, as the p-value is `r summary(detainee2.lm)$coef['Mon_Prim_Ttl', 'Pr(>|t|)']` (Summary above).
+
+***Regression Model 2: Assessments for Collinearity:***
+
+```{r, echo=FALSE, warning=FALSE}
+library(GGally)
+
+model2.var.names <- c("Prim_Schl_Ct","Pop_size", "Mon_Prim_Ttl")
+```
+
+```{r, echo=TRUE, warning=FALSE}
+ggpairs(det.count.ind[,c(model2.var.names)], axisLabels = "internal")
+
+```
+
+This graph is showing the possible correlations between our indicators in the model 2 regression. It looks like there is a positive correlation between: population size `Pop_size` and primary school count `Prim_Schl_Ct`, primary school count `Prim_Schl_Ct` and monastic school count `Mon_Prim_Ttl`, and monastic school count `Mon_Prim_Ttl` and population size `Pop_size`. TO verify this, we can conduct a correlation test. 
+
+```{r, echo=FALSE, warning=FALSE}
+cortest2 = cor.test(det.count.ind$Prim_Schl_Ct, det.count.ind$Mon_Prim_Ttl)
+
+cortest3 = cor.test(det.count.ind$Pop_size, det.count.ind$Mon_Prim_Ttl)
+```
+
+```{r, echo=TRUE, warning=FALSE}
+cortest2
+cortest3
+
+```
+
+These correlation tests show a significant correlation between: 
+1. population size `Pop_size` and primary school count `Prim_Schl_Ct` (cor = `r cortest1$estimate`)
+2. primary school count `Prim_Schl_Ct` and monastic school count `Mon_Prim_Ttl`  (cor = `r cortest2$estimate`)
+3. monastic school count `Mon_Prim_Ttl` and population size `Pop_size` (cor = `r cortest3$estimate`)
+
+Thus, our next model will remove population size and primary school count from the regression model, and we will see if this will increase the accuracy of our regression by removing collinearity.
+
+
+Based on these assessments, we will see if our new, more simplified model that is free from collinearity is more accurate or effective than our original model.
+
+```{r, echo=FALSE, warning=FALSE}
+detainee2.lm2 <- update(detainee2.lm, . ~ . - Pop_size - Prim_Schl_Ct)
+```
+
+```{r, echo=TRUE, warning=FALSE}
+summary(detainee2.lm2)
+```
+
+```{r, echo=FALSE, warning=FALSE}
+summary2 <- list(full.model=detainee2.lm,
+     mini.model=detainee2.lm2) %>%
+  modelsummary(statistic = NULL, stars = T)
+```
+```{r, echo=TRUE, warning=FALSE}
+summary2
+```
+
+The new model has a much smaller R2 (from `r round(summary(detainee2.lm)$r.squared,4)` to `r round(summary(detainee2.lm2)$r.squared,4)`) (Model summary above), making the regression much less representative of the data. 
+
+Additionally, the coefficient for monastic school count `Mon_Prim_Ttl` changes to a significant positive correlation of `r summary(detainee2.lm2)$coef['Mon_Prim_Ttl', 'Estimate']`. This is saying that for every additional monastic school added, the number of detainees increase by `r summary(detainee2.lm2)$coef['Mon_Prim_Ttl', 'Estimate']`, and this is a significant change (P-value = `r summary(detainee2.lm2)$coef['Mon_Prim_Ttl', 'Pr(>|t|)']`) (model summary above). The previous model stated the opposite effect (for every additional monastic school, number of detainees significantly decreased by `r summary(detainee2.lm)$coef['Mon_Prim_Ttl', 'Estimate']` (P-value = `r summary(detainee2.lm)$coef['Mon_Prim_Ttl', 'Pr(>|t|)']`) (model summary above). 
+
+
+
+# Limitations on Analysis:
+***1: Social and Fundamental Limitations:***
+We note various data limitations and assumptions below, focusing first on fundamental  limitations of the nature of this project. First, the situation in Myanmar is evolving. Only a few days ago, Myanmar’s ousted democratic leader, Aung San Suu Kyi, was indicted for crimes of inciting dissent and violating COVID-19 protocols. Recently, there were peaceful protests in Myanmar’s most populous city (Yangon), which resulted in the death of at least five protesters at the hands of the military (https://www.npr.org/2021/12/06/1061727105/a-court-in-myanmar-sentences-ousted-leader-suu-kyi-to-4-years). As the data for this report were pulled before these events, we cannot account for them in our various analyses. These are significant events; such considerations that cannot be taken lightly. 
+
+Second, the authors of this report are not experts on the history, economy, political milieu, etc. of Myanmar. While we have attempted to educate ourselves, we do not claim expertise on this subject matter. This topic is highly sensitive and, as mentioned above, highly dynamic. As outsiders to the subject material, we acknowledge that we lack the depth of context and understanding that we hope to bring to our future work as aspiring policy researchers and analysts. 
+
+***2: Data Limitations:*** 
+The Census data is from 2014, whereas the coup occurred in 2021. Thus, there is a time lag, and certain indicators may not be up-to-date. Further, the coup itself could impact (or be impacting) some, if not many, of these measures. Our analysis accounts for neither the time lag in Census data, nor the possible impacts of the coup on indicators. 
+
+In addition, given the fact that Census data is from 2014, when possible, we selected other indicators from the MIMU dataset that dated from the 2014-2015 year. While we could have used other data standardization techniques, such as taking the mean/median of various indicators across all years of data available, we chose to align based on year. This was to ensure that the indicators were speaking to each other as much as possible; we wanted the data to span the same time period. 
+
+In addition, many data points were lost in merging the various datasets. While we leveraged the “Leven” function to retain as much of the data as possible, we lost a substantial amount of data as a result of failed joins or failed fuzzy joins. As such, the final dataset we used for our linear regressions only contained 255 observations. It’s important to interpret our analysis and regression results with a grain of salt given the small sample size.
+
+Further, religious data were not available at the township level. Given the genocide of the Rohingya Muslim population and current refugee crisis, this would have been important data to include in regressions. While we attempted to substitute this with the number of monastic primary schools in a given township—assuming that monastic schools are Buddhist—this does not give the level of specificity that we would hope to account for. In context of Myanmar and the ongoing refugee crisis, religion is an incredibly important factor to take into account, and one which we were unable to consider given the data limitations. 
+
+
+# Contextualization for Policy, Stakeholders:
+A key conclusion of our analysis is that more men are detained than women. This may suggest that the nature of male versus female detainment may differ. While our analysis cannot shed light on how detainment and treatment differs by sex, some recent reports highlight how sexual violence may be one of the main tactics used to torture female detainees. Meanwhile, many young men are simply disappearing at the hands of the military. It is critical for international actors who seek to intervene to understand the unique tactics the military may be using depending on the sex of detainees.
+
+Going into our analysis, we hypothesized that education may be correlated with detainment rates. However, the results of our analysis suggest that education may not be highly correlated with detainment. This may be due to the relatively high literacy rates throughout the country resulting in limited variation in education-related indicators. This initial finding may reflect that detainment is not only impacting an “elite” class of individuals in Myanmar, unlike many other political situations throughout history.
+
+Our analysis underscores the importance of testing assumptions, especially among individuals who may not be familiar with the Myanmar political and social context. If international actors are to intervene, it is critical for them to have a thorough understanding of the country and the current situation.
+
+Finally, the policy implications we’ve outlined above are based on analysis of limited data. If more data becomes available, additional analysis should be conducted to ensure that similar trends hold true with a larger sample.
+
+# Future Directions:
+As highlighted throughout this report, the situation in Myanmar is highly dynamic. While many of the indicators used in this report are 7+ years old (e.g., Census data), the coup itself is likely impacting the indicators we have examined in real-time. Moving forward, we would like to explore how recent events, such as the indictment of Aung San Suu Kyi, have impacted fatality and detainee counts. We intuit that there will be a spike in detainee and fatality counts alike following her indictment, as recent events suggest.
+
+Further, we would like to explore longitudinal impacts of the coup—that is, will certain metrics, such as literacy rates, be influenced 10- or 20-years in the future by the coup? Or, given the country has long been under military leadership, will little change? 
+
+In addition, we would like to deepen our understanding of Myanmar’s historical and political contexts. This would enrich our analysis, while guiding us to explore factors and indicators that were not apparent to us in our initial review of the data.
+
+# Conclusions: 
+Our report analyzes various factors related to education and gender, in the hopes of deriving meaningful relationships regarding detainee and fatality counts resulting from the fallout of the coup in Myanmar. While many of our regressions and models did not generate statistically significant results, key observations emerged: 1) men are detained at higher rates than women; 2) literacy rates across the country are high; and 3) data limitations are significant. As we entered this project lacking the expertise and social/cultural context one would hope policy analysts would bring to bear on their work, we hope that our analysis highlights the fact context matters. International actors considering policy interventions in Myanmar must deeply educate themselves on a wide array of factors, not just education, in developing effective strategies to address the painful violence, murder, and genocide that the country has experienced and is experiencing yet today. 
+
+# Sources:
+- https://www.npr.org/2021/12/06/1061727105/a-court-in-myanmar-sentences-ousted-leader-suu-kyi-to-4-years
+- https://www.bbc.com/news/world-asia-pacific-11685977
+- https://www.nytimes.com/article/myanmar-news-protests-coup.html
+- https://www.nytimes.com/2019/12/11/world/asia/aung-san-suu-kyi-rohingya-myanmar-genocide-hague.html
+- https://www.bbc.com/news/world-asia-41566561
+- https://www.nytimes.com/2021/05/24/world/asia/myanmar-court-assk.html
+- https://www.nytimes.com/2021/02/02/opinion/myanmar-coup.html?action=click&pgtype=Article&state=default&module=styln-myanmar&variant=show&region=MAIN_CONTENT_3&block=storyline_levelup_swipe_recirc
+- https://www.atlanticcouncil.org/blogs/new-atlanticist/now-is-the-time-to-recognize-the-genocide-in-burma/
+- https://www.theguardian.com/world/2020/nov/23/myanmar-is-still-committing-genocide-against-rohingya-says-rights-group
